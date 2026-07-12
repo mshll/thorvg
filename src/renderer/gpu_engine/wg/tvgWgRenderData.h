@@ -40,26 +40,34 @@ struct WgImageData {
 };
 
 enum class WgRenderSettingsType { None = 0, Solid = 1, Linear = 2, Radial = 3 };
-enum class WgRenderRasterType { Solid = 0, Gradient, Image };
+
+static_assert(sizeof(RenderColor) == 4, "Solid color vertex data must remain tightly packed RGBA8");
+
+struct WgSolidData
+{
+    uint32_t colorInd{};
+    RenderColor color{};
+    uint8_t opacity = 255;
+
+    RenderColor packedColor() const
+    {
+        auto out = color;
+        out.a = MULTIPLY(out.a, opacity);
+        return out;
+    }
+};
 
 struct WgRenderSettings
 {
     uint32_t bindGroupInd{};
-    // Solid path: per-draw index into the instance-rate vec4 color stream.
-    uint32_t solidColorInd{};
     WgShaderTypePaintSettings settings;
-    WgShaderTypeVec4f solidColor;
     WgImageData gradientData;
     WgRenderSettingsType fillType{};
-    WgRenderRasterType rasterType{};
     float opacityMultiplier = 1.0f;
-    float opacity = 1.0f;
     bool skip{};
 
-    void bakeSolidColor();
-    void update(WgContext& context, tvg::ColorSpace cs, uint8_t opacity);
+    uint8_t updateOpacity(tvg::ColorSpace cs, uint8_t opacity);
     void update(WgContext& context, const Fill* fill, const Matrix* modelTransform, bool updateColorRamp);
-    void update(WgContext& context, const RenderColor& c);
     void release(WgContext& context);
 };
 
@@ -80,7 +88,9 @@ struct WgRenderDataPaint
 struct WgRenderDataShape: public WgRenderDataPaint
 {
     WgRenderSettings renderSettingsShape{};
+    WgSolidData solidShape{};
     WgRenderSettings renderSettingsStroke{};
+    WgSolidData solidStroke{};
     WgMeshData meshBBox{};
     WgMeshData meshShape{};
     WgMeshData meshShapeBBox{};
@@ -139,6 +149,16 @@ public:
     void release(WgContext& context);
 };
 
+struct WgSolidBatchRange
+{
+    size_t vertexOffset{};
+    size_t indexOffset{};
+    size_t colorOffset{};
+    uint32_t vertexCount{};
+    uint32_t indexCount{};
+    RenderRegion viewport{};
+};
+
 // gaussian blur, drop shadow, fill, tint, tritone
 #define WG_GAUSSIAN_MAX_LEVEL 3
 struct WgRenderDataEffectParams
@@ -182,6 +202,7 @@ public:
     void append(WgMeshData* meshData);
     void append(WgRenderDataShape* renderDataShape);
     void append(WgRenderDataPicture* renderDataPicture);
+    void appendSolidBatch(const Array<WgRenderDataShape*>& renderDataShapes, WgSolidBatchRange& range);
     void initialize(WgContext& context){};
     void release(WgContext& context);
     void clear();
@@ -190,14 +211,17 @@ public:
 
 class WgStageBufferSolidColor {
 private:
-    Array<WgShaderTypeVec4f> vbuffer;
+    Array<RenderColor> vbuffer;
+
 public:
     WGPUBuffer vbuffer_gpu{};
 
-    uint32_t append(const WgShaderTypeVec4f& value) {
+    uint32_t append(const RenderColor& value)
+    {
         vbuffer.push(value);
         return vbuffer.count - 1;
     }
+    uint32_t appendRepeated(const RenderColor& value, uint32_t count);
 
     void release(WgContext& context);
     void clear();
