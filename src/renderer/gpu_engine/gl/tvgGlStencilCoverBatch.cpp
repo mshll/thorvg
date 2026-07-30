@@ -189,7 +189,12 @@ void GlStencilCoverBatch::addBounds(const RenderRegion& bounds)
 {
     auto p = this->bounds.count;
     auto min = ySorted ? bounds.min.y : bounds.min.x;
-    this->bounds.grow(1);
+    // Sorted insertion bypasses Array::push(), so reserve geometrically.
+    if (this->bounds.full()) {
+        auto capacity = this->bounds.reserved ? this->bounds.reserved << 1 : 1;
+        if (capacity > BATCH_REGION_MAX_COUNT) capacity = BATCH_REGION_MAX_COUNT;
+        this->bounds.reserve(capacity);
+    }
     while (p > 0 && (ySorted ? this->bounds[p - 1].min.y : this->bounds[p - 1].min.x) > min) {
         this->bounds[p] = this->bounds[p - 1];
         --p;

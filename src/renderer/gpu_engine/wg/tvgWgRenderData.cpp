@@ -83,21 +83,11 @@ void WgImageData::release(WgContext& context)
 // WgRenderSettings
 //***********************************************************************
 
-void WgRenderSettings::bakeSolidColor()
+uint8_t WgRenderSettings::updateOpacity(tvg::ColorSpace cs, uint8_t opacity)
 {
-    if (fillType != WgRenderSettingsType::Solid) return;
-    settings.color = solidColor;
-    settings.color.vec[3] *= opacity;
-    settings.options.vec[3] = 1.0f;
-}
-
-
-void WgRenderSettings::update(TVG_UNUSED WgContext& context, tvg::ColorSpace cs, uint8_t opacity)
-{
-    //TODO: Update separately according to the RenderUpdateFlag
-    settings.options.update(cs, opacity * opacityMultiplier);
-    this->opacity = settings.options.vec[3];
-    bakeSolidColor();
+    auto effectiveOpacity = static_cast<uint8_t>(opacity * opacityMultiplier);
+    settings.options.update(cs, effectiveOpacity);
+    return effectiveOpacity;
 }
 
 void WgRenderSettings::update(WgContext& context, const Fill* fill, const Matrix* modelTransform, bool updateColorRamp)
@@ -105,23 +95,10 @@ void WgRenderSettings::update(WgContext& context, const Fill* fill, const Matrix
     assert(fill);
     settings.gradient.update(fill, modelTransform);
     if (updateColorRamp) gradientData.update(context, fill);
-    // get gradient rasterisation settings
-    rasterType = WgRenderRasterType::Gradient;
     if (fill->type() == Type::LinearGradient)
         fillType = WgRenderSettingsType::Linear;
     else if (fill->type() == Type::RadialGradient)
         fillType = WgRenderSettingsType::Radial;
-    settings.options.vec[3] = opacity;
-};
-
-
-void WgRenderSettings::update(TVG_UNUSED WgContext& context, const RenderColor& c)
-{
-    solidColor.update(c);
-    settings.color = solidColor;
-    rasterType = WgRenderRasterType::Solid;
-    fillType = WgRenderSettingsType::Solid;
-    bakeSolidColor();
 };
 
 
@@ -492,31 +469,47 @@ void WgRenderDataEffectParamsPool::release(WgContext& context)
 // WgStageBufferGeometry
 //***********************************************************************
 
+static bool reserveStageBytes(Array<uint8_t>& buffer, uint32_t appendSize)
+{
+    const uint64_t required = static_cast<uint64_t>(buffer.count) + appendSize;
+    if (required > UINT32_MAX) return false;
+    if (required <= buffer.reserved) return true;
+
+    const uint64_t geometric = static_cast<uint64_t>(buffer.count) + std::max<uint64_t>(appendSize, buffer.reserved);
+    const uint64_t capacity = std::min<uint64_t>(UINT32_MAX, std::max(required, geometric));
+    return buffer.reserve(static_cast<uint32_t>(capacity));
+}
+
+
 void WgStageBufferGeometry::append(WgMeshData* meshData)
 {
     assert(meshData);
-    uint32_t vsize = meshData->vbuffer.count * sizeof(meshData->vbuffer[0]);
-    uint32_t tsize = meshData->tbuffer.count * sizeof(meshData->tbuffer[0]);
-    uint32_t isize = meshData->ibuffer.count * sizeof(meshData->ibuffer[0]);
+    const uint64_t vsize64 = static_cast<uint64_t>(meshData->vbuffer.count) * sizeof(meshData->vbuffer[0]);
+    const uint64_t tsize64 = static_cast<uint64_t>(meshData->tbuffer.count) * sizeof(meshData->tbuffer[0]);
+    const uint64_t isize64 = static_cast<uint64_t>(meshData->ibuffer.count) * sizeof(meshData->ibuffer[0]);
+    const uint64_t vertexAppendSize = vsize64 + tsize64;
+    const bool sizesValid = vertexAppendSize <= UINT32_MAX && isize64 <= UINT32_MAX;
+    const bool vertexReserved = sizesValid && reserveStageBytes(vbuffer, static_cast<uint32_t>(vertexAppendSize));
+    const bool indexReserved = sizesValid && reserveStageBytes(ibuffer, static_cast<uint32_t>(isize64));
+    assert(vertexReserved && indexReserved);
+    if (!vertexReserved || !indexReserved) return;
+
+    const uint32_t vsize = static_cast<uint32_t>(vsize64);
+    const uint32_t tsize = static_cast<uint32_t>(tsize64);
+    const uint32_t isize = static_cast<uint32_t>(isize64);
     // append vertex data
-    if (vbuffer.reserved < vbuffer.count + vsize)
-        vbuffer.grow(std::max(vsize, vbuffer.reserved));
     if (meshData->vbuffer.count > 0) {
         meshData->voffset = vbuffer.count;
         memcpy(vbuffer.data + vbuffer.count, meshData->vbuffer.data, vsize);
         vbuffer.count += vsize;
     }
     // append tex coords data
-    if (vbuffer.reserved < vbuffer.count + tsize)
-        vbuffer.grow(std::max(tsize, vbuffer.reserved));
     if (meshData->tbuffer.count > 0) {
         meshData->toffset = vbuffer.count;
         memcpy(vbuffer.data + vbuffer.count, meshData->tbuffer.data, tsize);
         vbuffer.count += tsize;
     }
     // append index data
-    if (ibuffer.reserved < ibuffer.count + isize)
-        ibuffer.grow(std::max(isize, ibuffer.reserved));
     if (meshData->ibuffer.count > 0) {
         meshData->ioffset = ibuffer.count;
         memcpy(ibuffer.data + ibuffer.count, meshData->ibuffer.data, isize);
@@ -541,6 +534,100 @@ void WgStageBufferGeometry::append(WgRenderDataPicture* renderDataPicture)
 }
 
 
+void WgStageBufferGeometry::appendBatch(const Array<WgRenderDataShape*>& renderDataShapes, WgGeometryRange& range, WgMeshData WgRenderDataShape::* meshMember)
+{
+    assert(renderDataShapes.count > 1);
+
+    uint64_t vertexCount = 0;
+    uint64_t indexCount = 0;
+    ARRAY_FOREACH(p, renderDataShapes) {
+        auto& mesh = (*p)->*meshMember;
+        vertexCount += mesh.vbuffer.count;
+        indexCount += mesh.ibuffer.count;
+    }
+    assert(vertexCount * sizeof(Point) <= UINT32_MAX);
+    assert(indexCount * sizeof(uint32_t) <= UINT32_MAX);
+
+    const uint32_t vsize = static_cast<uint32_t>(vertexCount * sizeof(Point));
+    const uint32_t isize = static_cast<uint32_t>(indexCount * sizeof(uint32_t));
+    const bool vertexReserved = reserveStageBytes(vbuffer, vsize);
+    const bool indexReserved = reserveStageBytes(ibuffer, isize);
+    assert(vertexReserved && indexReserved);
+    if (!vertexReserved || !indexReserved) {
+        range = {};
+        return;
+    }
+
+    appendBatchReserved(renderDataShapes, range, meshMember, static_cast<uint32_t>(vertexCount), static_cast<uint32_t>(indexCount));
+}
+
+
+void WgStageBufferGeometry::appendBatchReserved(const Array<WgRenderDataShape*>& renderDataShapes, WgGeometryRange& range, WgMeshData WgRenderDataShape::* meshMember, uint32_t vertexCount, uint32_t indexCount)
+{
+    assert(renderDataShapes.count > 1);
+
+    range.vertexOffset = vbuffer.count;
+    range.indexOffset = ibuffer.count;
+    range.vertexCount = vertexCount;
+    range.indexCount = indexCount;
+
+    uint32_t baseVertex = 0;
+    auto vertexDst = vbuffer.data + vbuffer.count;
+    auto indexDst = ibuffer.data + ibuffer.count;
+    ARRAY_FOREACH(p, renderDataShapes) {
+        auto mesh = &((*p)->*meshMember);
+        const uint32_t meshVSize = mesh->vbuffer.count * sizeof(Point);
+        memcpy(vertexDst, mesh->vbuffer.data, meshVSize);
+        vertexDst += meshVSize;
+
+        const auto src = mesh->ibuffer.data;
+        const auto count = mesh->ibuffer.count;
+        for (uint32_t i = 0; i < count; ++i) {
+            auto index = src[i] + baseVertex;
+            memcpy(indexDst + i * sizeof(index), &index, sizeof(index));
+        }
+        indexDst += count * sizeof(uint32_t);
+        baseVertex += mesh->vbuffer.count;
+    }
+    vbuffer.count += vertexCount * sizeof(Point);
+    ibuffer.count += indexCount * sizeof(uint32_t);
+}
+
+
+void WgStageBufferGeometry::appendSolidBatch(const Array<WgRenderDataShape*>& renderDataShapes, WgSolidBatchRange& range)
+{
+    appendBatch(renderDataShapes, range, &WgRenderDataShape::meshShape);
+}
+
+
+void WgStageBufferGeometry::appendStencilBatch(const Array<WgRenderDataShape*>& renderDataShapes, WgStencilBatchRange& range)
+{
+    uint64_t stencilVertexCount = 0;
+    uint64_t stencilIndexCount = 0;
+    uint64_t coverVertexCount = 0;
+    uint64_t coverIndexCount = 0;
+    ARRAY_FOREACH(p, renderDataShapes) {
+        stencilVertexCount += (*p)->meshShape.vbuffer.count;
+        stencilIndexCount += (*p)->meshShape.ibuffer.count;
+        coverVertexCount += (*p)->meshBBox.vbuffer.count;
+        coverIndexCount += (*p)->meshBBox.ibuffer.count;
+    }
+    const uint64_t vertexSize = (stencilVertexCount + coverVertexCount) * sizeof(Point);
+    const uint64_t indexSize = (stencilIndexCount + coverIndexCount) * sizeof(uint32_t);
+    const bool sizesValid = vertexSize <= UINT32_MAX && indexSize <= UINT32_MAX;
+    const bool vertexReserved = sizesValid && reserveStageBytes(vbuffer, static_cast<uint32_t>(vertexSize));
+    const bool indexReserved = sizesValid && reserveStageBytes(ibuffer, static_cast<uint32_t>(indexSize));
+    assert(vertexReserved && indexReserved);
+    if (!vertexReserved || !indexReserved) {
+        range = {};
+        return;
+    }
+
+    appendBatchReserved(renderDataShapes, range.stencil, &WgRenderDataShape::meshShape, static_cast<uint32_t>(stencilVertexCount), static_cast<uint32_t>(stencilIndexCount));
+    appendBatchReserved(renderDataShapes, range.cover, &WgRenderDataShape::meshBBox, static_cast<uint32_t>(coverVertexCount), static_cast<uint32_t>(coverIndexCount));
+}
+
+
 void WgStageBufferGeometry::release(WgContext& context)
 {
     context.releaseBuffer(vbuffer_gpu);
@@ -557,7 +644,7 @@ void WgStageBufferGeometry::clear()
 
 void WgStageBufferGeometry::flush(WgContext& context) 
 {
-    context.allocateBufferVertex(vbuffer_gpu, (float *)vbuffer.data, vbuffer.count);
+    context.allocateBufferVertex(vbuffer_gpu, vbuffer.data, vbuffer.count);
     context.allocateBufferIndex(ibuffer_gpu, (uint32_t *)ibuffer.data, ibuffer.count);
 }
 
@@ -577,10 +664,24 @@ void WgStageBufferSolidColor::clear()
 }
 
 
+uint32_t WgStageBufferSolidColor::appendRepeated(const RenderColor& value, uint32_t count)
+{
+    const uint32_t offset = vbuffer.count;
+    if (count == 0) return offset;
+    assert(count <= UINT32_MAX - vbuffer.count);
+    if (vbuffer.reserved < vbuffer.count + count)
+        vbuffer.grow(std::max(count, vbuffer.reserved));
+    auto dst = vbuffer.data + vbuffer.count;
+    for (uint32_t i = 0; i < count; ++i) dst[i] = value;
+    vbuffer.count += count;
+    return offset;
+}
+
+
 void WgStageBufferSolidColor::flush(WgContext& context)
 {
     if (vbuffer.count > 0)
-        context.allocateBufferVertex(vbuffer_gpu, (float*)vbuffer.data, vbuffer.count * sizeof(WgShaderTypeVec4f));
+        context.allocateBufferVertex(vbuffer_gpu, vbuffer.data, vbuffer.count * sizeof(RenderColor));
 }
 
 //***********************************************************************

@@ -179,7 +179,7 @@ bool WgContext::allocateBufferUniform(WGPUBuffer& buffer, const void* data, uint
 }
 
 
-bool WgContext::allocateBufferVertex(WGPUBuffer& buffer, const float* data, uint64_t size)
+bool WgContext::allocateBufferVertex(WGPUBuffer& buffer, const void* data, uint64_t size)
 {
     if ((buffer) && (wgpuBufferGetSize(buffer) >= size))
         wgpuQueueWriteBuffer(queue, buffer, 0, data, size);
